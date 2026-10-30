@@ -4,118 +4,122 @@ import sys
 
 from utils import PacketHeader, compute_checksum
 
-# Loại gói
-START, END, DATA, ACK = 0, 1, 2, 3
-
-HEADER_SIZE = 16
-
+T_START, T_END, T_DATA, T_ACK = 0, 1, 2, 3
+HDR_LEN = 16
 DEBUG = False
 
 
-def log(*args):
-    """In debug ra stderr. TUYỆT ĐỐI không in ra stdout vì stdout là file output."""
+def trace(*parts):
+    """Ghi vết ra stderr (stdout dành riêng cho message nhận được)."""
     if DEBUG:
-        print(*args, file=sys.stderr)
+        sys.stderr.write(" ".join(str(p) for p in parts) + "\n")
         sys.stderr.flush()
 
 
-def make_packet(pkt_type, seq_num, data=b""):
-    """Tạo gói hoàn chỉnh (header + data) dạng bytes, đã có checksum."""
-    header = PacketHeader(type=pkt_type, seq_num=seq_num, length=len(data))
-    header.checksum = compute_checksum(header / data)
-    return bytes(header / data)
+def encode(kind, seq, payload=b""):
+    """Đóng gói thành datagram: header (đã điền checksum) + payload."""
+    hdr = PacketHeader(type=kind, seq_num=seq, length=len(payload), checksum=0)
+    hdr.checksum = compute_checksum(hdr / payload)
+    return bytes(hdr / payload)
 
 
-def parse_packet(raw):
-    """Trả về (header, data) nếu gói hợp lệ, ngược lại trả về None."""
-    if len(raw) < HEADER_SIZE:
+def decode(datagram):
+    """Trả về (kind, seq, payload), hoặc None nếu gói thiếu byte / sai checksum."""
+    if len(datagram) < HDR_LEN:
         return None
-    header = PacketHeader(raw[:HEADER_SIZE])
-    if len(raw) < HEADER_SIZE + header.length:
+    hdr = PacketHeader(datagram[:HDR_LEN])
+    payload = datagram[HDR_LEN:HDR_LEN + hdr.length]
+    if len(payload) != hdr.length:
         return None
-    data = raw[HEADER_SIZE:HEADER_SIZE + header.length]
-    received_checksum = header.checksum
-    header.checksum = 0
-    if received_checksum != compute_checksum(header / data):
-        return None  # hỏng checksum -> bỏ gói, không ACK
-    return header, data
+    claimed = hdr.checksum
+    hdr.checksum = 0
+    if compute_checksum(hdr / payload) != claimed:
+        return None
+    return hdr.type, hdr.seq_num, payload
 
 
-def receiver(receiver_ip, receiver_port, window_size):
-    """Nhận message, ghi ra stdout, gửi ACK RIÊNG cho từng gói (selective ACK)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind((receiver_ip, receiver_port))
-    out = sys.stdout.buffer
+class ReorderBuffer:
+    """Giữ các gói đến sớm và đẩy ra sink đúng thứ tự seq_num."""
 
-    connected = False
-    expected = 1      # N: seq_num nhỏ nhất chưa nhận đủ (đầu window)
-    buffer = {}       # seq_num -> data của các gói đến sai thứ tự
+    def __init__(self, capacity, sink):
+        self.capacity = capacity
+        self.sink = sink
+        self.head = 1          # seq_num kế tiếp cần giao cho sink
+        self.held = {}         # seq_num -> payload đang chờ
 
-    while True:
-        raw, addr = s.recvfrom(2048)
+    def in_range(self, seq):
+        """Gói có nằm trong cửa sổ nhận không (cận trên: head + capacity)."""
+        return seq < self.head + self.capacity
 
-        parsed = parse_packet(raw)
-        if parsed is None:
-            continue
-        header, data = parsed
+    def store(self, seq, payload):
+        if seq >= self.head:
+            self.held.setdefault(seq, payload)
+        while self.head in self.held:
+            self.sink.write(self.held.pop(self.head))
+            self.head += 1
+        self.sink.flush()      # ghi xuống ngay, phòng khi receiver bị dừng đột ngột
 
-        # ---------- START ----------
-        if header.type == START:
-            if not connected:          # đang có kết nối thì bỏ qua START
-                connected = True
-                expected = 1
-                buffer = {}
-                s.sendto(make_packet(ACK, 1), addr)
-                log("START, connected")
-            continue
 
-        if not connected:
-            continue
+class RtpReceiver:
+    def __init__(self, ip, port, window):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((ip, port))
+        self.window = window
+        self.buf = None        # None = chưa có kết nối nào
+        self.peer = None       # địa chỉ của sender đang được phục vụ
 
-        # ---------- DATA ----------
-        if header.type == DATA:
-            seq = header.seq_num
-            if seq >= expected + window_size:
-                log("drop (ngoài window)", seq)
-                continue               # bỏ gói, không ACK
-            if seq >= expected and seq not in buffer:
-                buffer[seq] = data     # lưu gói (kể cả sai thứ tự)
-            # Ghi ra các gói liên tiếp bắt đầu từ `expected`
-            while expected in buffer:
-                out.write(buffer.pop(expected))
-                expected += 1
-            # ACK RIÊNG: seq_num đúng bằng seq_num của gói vừa nhận
-            # (kể cả gói cũ seq < expected, vì ACK trước đó có thể đã bị mất)
-            s.sendto(make_packet(ACK, seq), addr)
-            log("DATA", seq, "-> ACK", seq, "| expected =", expected)
+    def ack(self, addr, seq):
+        self.sock.sendto(encode(T_ACK, seq), addr)
 
-        # ---------- END ----------
-        elif header.type == END:
-            if header.seq_num == expected:
-                s.sendto(make_packet(ACK, header.seq_num), addr)
-                log("END, exit")
-                break
-            # END chỉ được gửi sau khi mọi DATA đã được ACK nên bình thường
-            # luôn có seq_num == expected; nếu không thì bỏ qua.
+    # Mỗi handler trả về True khi phiên truyền đã kết thúc.
+    def on_start(self, addr, seq, payload):
+        if self.buf is None:
+            self.buf = ReorderBuffer(self.window, sys.stdout.buffer)
+            self.peer = addr
+            self.ack(addr, 1)
+            trace("session opened")
+        elif addr == self.peer and self.buf.head == 1 and not self.buf.held:
+            # Sender cũ gửi lại START vì ACK bị mất và chưa có dữ liệu nào đến:
+            # trả lời lại. START từ nơi khác, hoặc đến muộn, vẫn bị bỏ qua.
+            self.ack(addr, 1)
+        return False
 
-    out.flush()
-    s.close()
+    def on_data(self, addr, seq, payload):
+        if self.buf is None or not self.buf.in_range(seq):
+            return False
+        self.buf.store(seq, payload)
+        self.ack(addr, seq)            # xác nhận riêng đúng gói này
+        trace("got", seq, "head", self.buf.head)
+        return False
+
+    def on_end(self, addr, seq, payload):
+        if self.buf is None or seq != self.buf.head:
+            return False
+        self.ack(addr, seq)
+        return True
+
+    def serve(self):
+        handlers = {T_START: self.on_start, T_DATA: self.on_data, T_END: self.on_end}
+        finished = False
+        while not finished:
+            datagram, addr = self.sock.recvfrom(2048)
+            msg = decode(datagram)
+            if msg is None:
+                continue
+            kind, seq, payload = msg
+            handler = handlers.get(kind)
+            finished = bool(handler and handler(addr, seq, payload))
+        sys.stdout.buffer.flush()
+        self.sock.close()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "receiver_ip", help="The IP address of the host that receiver is running on"
-    )
-    parser.add_argument(
-        "receiver_port", type=int, help="The port number on which receiver is listening"
-    )
-    parser.add_argument(
-        "window_size", type=int, help="Maximum number of outstanding packets"
-    )
+    parser.add_argument("receiver_ip", help="The IP address of the host that receiver is running on")
+    parser.add_argument("receiver_port", type=int, help="The port number on which receiver is listening")
+    parser.add_argument("window_size", type=int, help="Maximum number of outstanding packets")
     args = parser.parse_args()
-
-    receiver(args.receiver_ip, args.receiver_port, args.window_size)
+    RtpReceiver(args.receiver_ip, args.receiver_port, args.window_size).serve()
 
 
 if __name__ == "__main__":
