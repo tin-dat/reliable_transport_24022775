@@ -93,8 +93,8 @@ def sender(receiver_ip, receiver_port, window_size):
             for seq in range(base, next_seq):
                 s.sendto(packets[seq], dest)
             deadline = time.time() + TIMEOUT
-        elif ack.seq_num > base:
-            base = min(ack.seq_num, end_seq)
+        elif base < ack.seq_num <= next_seq:
+            base = ack.seq_num
             deadline = time.time() + TIMEOUT
             log("ack", ack.seq_num, "base ->", base)
 
@@ -106,11 +106,18 @@ def sender(receiver_ip, receiver_port, window_size):
         if ack is None:
             log("END timer expired")
             break
-        if ack.seq_num > end_seq:
+        if ack.seq_num == end_seq + 1:
             log("END acked")
             break
 
     s.close()
+
+
+def positive_int(text):
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("window_size phải là số nguyên dương")
+    return value
 
 
 def main():
@@ -122,7 +129,7 @@ def main():
         "receiver_port", type=int, help="The port number on which receiver is listening"
     )
     parser.add_argument(
-        "window_size", type=int, help="Maximum number of outstanding packets"
+        "window_size", type=positive_int, help="Maximum number of outstanding packets"
     )
     args = parser.parse_args()
 
