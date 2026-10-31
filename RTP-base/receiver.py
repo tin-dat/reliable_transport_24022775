@@ -98,6 +98,13 @@ def receiver(receiver_ip, receiver_port, window_size):
     s.close()
 
 
+def positive_int(text):
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("window_size phải là số nguyên dương")
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -107,7 +114,7 @@ def main():
         "receiver_port", type=int, help="The port number on which receiver is listening"
     )
     parser.add_argument(
-        "window_size", type=int, help="Maximum number of outstanding packets"
+        "window_size", type=positive_int, help="Maximum number of outstanding packets"
     )
     args = parser.parse_args()
 
