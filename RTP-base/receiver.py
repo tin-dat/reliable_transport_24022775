@@ -48,6 +48,7 @@ def receiver(receiver_ip, receiver_port, window_size):
     out = sys.stdout.buffer
 
     connected = False
+    peer = None       # địa chỉ của sender đang được phục vụ
     expected = 1      # N: seq_num của gói đang mong đợi
     buffer = {}       # seq_num -> data của các gói đến sai thứ tự
 
@@ -63,10 +64,14 @@ def receiver(receiver_ip, receiver_port, window_size):
         if header.type == START:
             if not connected:          # đang có kết nối thì bỏ qua START
                 connected = True
+                peer = addr
                 expected = 1
                 buffer = {}
                 s.sendto(make_packet(ACK, 1), addr)
                 log("START, connected")
+            elif addr == peer and expected == 1 and not buffer:
+                # Sender cũ gửi lại START vì ACK bị mất, chưa có dữ liệu nào đến
+                s.sendto(make_packet(ACK, 1), addr)
             continue
 
         if not connected:
@@ -84,6 +89,7 @@ def receiver(receiver_ip, receiver_port, window_size):
             while expected in buffer:
                 out.write(buffer.pop(expected))
                 expected += 1
+            out.flush()                # ghi xuống ngay, phòng khi bị dừng đột ngột
             s.sendto(make_packet(ACK, expected), addr)
             log("DATA", seq, "-> ACK", expected)
 
