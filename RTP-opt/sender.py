@@ -19,14 +19,12 @@ def trace(*parts):
 
 
 def encode(kind, seq, payload=b""):
-    """Đóng gói thành datagram: header (đã điền checksum) + payload."""
     hdr = PacketHeader(type=kind, seq_num=seq, length=len(payload), checksum=0)
     hdr.checksum = compute_checksum(hdr / payload)
     return bytes(hdr / payload)
 
 
 def decode(datagram):
-    """Trả về (kind, seq, payload), hoặc None nếu gói thiếu byte / sai checksum."""
     if len(datagram) < HDR_LEN:
         return None
     hdr = PacketHeader(datagram[:HDR_LEN])
@@ -41,8 +39,6 @@ def decode(datagram):
 
 
 class Timer:
-    """Đồng hồ đếm ngược một lần, dùng chung cho cả cửa sổ."""
-
     def __init__(self, span):
         self.span = span
         self.expiry = 0.0
@@ -55,28 +51,23 @@ class Timer:
 
 
 class SendWindow:
-    """Theo dõi trạng thái các gói DATA có seq_num từ 1 đến `last`."""
-
     def __init__(self, size, last):
         self.size = size
         self.last = last
-        self.lo = 1            # gói đầu tiên chưa được xác nhận
-        self.hi = 1            # gói đầu tiên chưa từng gửi
-        self.acked = set()     # các gói trong cửa sổ đã được ACK riêng
+        self.lo = 1
+        self.hi = 1
+        self.acked = set()
 
     def fresh(self):
-        """Các seq mới được phép gửi lúc này (đồng thời dịch mốc `hi`)."""
         limit = min(self.lo + self.size, self.last + 1)
         batch = list(range(self.hi, limit))
         self.hi = max(self.hi, limit)
         return batch
 
     def missing(self):
-        """Các gói đã gửi nhưng chưa có ACK."""
         return [q for q in range(self.lo, self.hi) if q not in self.acked]
 
     def record(self, seq):
-        """Ghi nhận một ACK. Trả về True nếu cửa sổ trượt tới trước."""
         if not (self.lo <= seq < self.hi):
             return False
         self.acked.add(seq)
@@ -101,7 +92,6 @@ class RtpSender:
         self.sock.sendto(datagram, self.dest)
 
     def listen_ack(self):
-        """Chờ tới khi timer hết giờ. Trả về seq của ACK hợp lệ đầu tiên, hoặc None."""
         while True:
             left = self.timer.remaining()
             if left <= 0:
@@ -121,7 +111,12 @@ class RtpSender:
             self.emit(hello)
             self.timer.restart()
             if self.listen_ack() == 1:
-                return
+                break
+        self.timer.span = 0.1
+        self.timer.restart()
+        while self.listen_ack() is not None:
+            pass
+        self.timer.span = RTO
 
     def transfer(self, chunks):
         frames = {n: encode(T_DATA, n, c) for n, c in enumerate(chunks, start=1)}
@@ -132,7 +127,6 @@ class RtpSender:
                 self.emit(frames[seq])
             acked = self.listen_ack()
             if acked is None:
-                # Hết giờ: chỉ phát lại những gói chưa có ACK
                 for seq in win.missing():
                     self.emit(frames[seq])
                 trace("retransmit", win.missing())
