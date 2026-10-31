@@ -152,11 +152,18 @@ def run_sender(ip, port, window_size):
     tx.close(end_seq)
 
 
+def positive_int(text):
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("window_size phải là số nguyên dương")
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("receiver_ip", help="The IP address of the host that receiver is running on")
     parser.add_argument("receiver_port", type=int, help="The port number on which receiver is listening")
-    parser.add_argument("window_size", type=int, help="Maximum number of outstanding packets")
+    parser.add_argument("window_size", type=positive_int, help="Maximum number of outstanding packets")
     args = parser.parse_args()
     run_sender(args.receiver_ip, args.receiver_port, args.window_size)
 
